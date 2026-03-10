@@ -48,6 +48,16 @@ def high_tc_config() -> dict:
 # ============================================================
 # Paths / knobs
 # ============================================================
+QUOTES_FILE = "cleaned_quotes_with_iv_1dte.csv"
+FEATURE_PRED_FILE = "boundary_layer_test_feature_predictions.csv"
+DEFAULT_IV_INPUT_DIR = Path("IV_Out")
+DEFAULT_FEATURE_INPUT_DIR = Path("Calibration_Out")
+DEFAULT_OUTPUT_DIR = Path("Backtest_Out")
+
+# Runtime paths populated in main
+QUOTES_CSV: Path | None = None
+FEATURE_PRED_CSV: Path | None = None
+OUT_DIR: Path = DEFAULT_OUTPUT_DIR
 
 MIN_MID = 0.05
 MAX_ABS_K_MAIN = 0.03
@@ -1043,14 +1053,25 @@ def plot_rehedge_timing(timing: pd.DataFrame) -> None:
 # Main
 # ============================================================
 def main(
-        quotes_csv_file : str = Path("/cleaned_quotes_with_iv_1dte.csv"),
-        featured_predictions_csv : str = Path("/boundary_layer_test_feature_predictions.csv"),
-        output_dir = Path("")
-        ) -> None:
-    
-    QUOTES_CSV = quotes_csv_file
-    FEATURE_PRED_CSV = featured_predictions_csv
-    OUT_DIR = output_dir
+    IV_INPUT_DIR: str = str(DEFAULT_IV_INPUT_DIR),
+    FEATURE_INPUT_DIR: str = str(DEFAULT_FEATURE_INPUT_DIR),
+    OUTPUT_DIR: str = str(DEFAULT_OUTPUT_DIR),
+) -> None:
+    global QUOTES_CSV, FEATURE_PRED_CSV, OUT_DIR
+
+    iv_input_dir = Path(IV_INPUT_DIR)
+    feat_input_dir = Path(FEATURE_INPUT_DIR)
+    out_dir = Path(OUTPUT_DIR)
+
+    QUOTES_CSV = iv_input_dir / QUOTES_FILE
+    FEATURE_PRED_CSV = feat_input_dir / FEATURE_PRED_FILE
+    OUT_DIR = out_dir
+
+    if not QUOTES_CSV.exists():
+        raise FileNotFoundError(f"Expected quote file: {QUOTES_CSV}")
+    if not FEATURE_PRED_CSV.exists():
+        raise FileNotFoundError(f"Expected prediction file: {FEATURE_PRED_CSV}")
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     feat = load_feature_panel()
