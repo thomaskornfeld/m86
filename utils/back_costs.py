@@ -48,9 +48,6 @@ def high_tc_config() -> dict:
 # ============================================================
 # Paths / knobs
 # ============================================================
-QUOTES_CSV = Path("/Users/brendonbazzani/VS Code Projects-python/cleaned_quotes_with_iv_1dte.csv")
-FEATURE_PRED_CSV = Path("/Users/brendonbazzani/VS Code Projects-python/boundary_layer_test_feature_predictions.csv")
-OUT_DIR = Path("/Users/brendonbazzani/VS Code Projects-python")
 
 MIN_MID = 0.05
 MAX_ABS_K_MAIN = 0.03
@@ -1046,10 +1043,14 @@ def plot_rehedge_timing(timing: pd.DataFrame) -> None:
 # Main
 # ============================================================
 def main(
-        QUOTES_CSV : str = Path("/cleaned_quotes_with_iv_1dte.csv"),
-        FEATURE_PRED_CSV : str = Path("/boundary_layer_test_feature_predictions.csv"),
-        OUT_DIR = Path("")
+        quotes_csv_file : str = Path("/cleaned_quotes_with_iv_1dte.csv"),
+        featured_predictions_csv : str = Path("/boundary_layer_test_feature_predictions.csv"),
+        output_dir = Path("")
         ) -> None:
+    
+    QUOTES_CSV = quotes_csv_file
+    FEATURE_PRED_CSV = featured_predictions_csv
+    OUT_DIR = output_dir
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     feat = load_feature_panel()
