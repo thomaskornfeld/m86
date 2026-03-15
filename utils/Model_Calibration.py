@@ -218,8 +218,8 @@ def main(
     INPUT_DIR: str = str(DEFAULT_INPUT_DIR),
     OUTPUT_DIR: str = str(DEFAULT_OUTPUT_DIR),
 ) -> None:
-    in_dir = Path(INPUT_DIR)
-    out_dir = Path(OUTPUT_DIR)
+    in_dir = Path(INPUT_DIR).expanduser()
+    out_dir = Path(OUTPUT_DIR).expanduser()
 
     in_path = in_dir / FEATURES_FILE
     if not in_path.exists():

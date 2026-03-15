@@ -285,15 +285,26 @@ def plot_intraday_regimes(df: pd.DataFrame, day: pd.Timestamp, out_dir: Path) ->
         plt.close()
 
 
+def resolve_plot_day(df: pd.DataFrame, requested_day: str | None) -> pd.Timestamp:
+    if requested_day is not None:
+        day = pd.to_datetime(requested_day).normalize()
+        if day not in set(df["trade_date"]):
+            raise ValueError(f"PLOT_DAY={requested_day} is not available in features.")
+        return day
+
+    return choose_plot_day(df, requested_day=None)
+
+
 def main(
-    INPUT_DIR: str = str(DEFAULT_INPUT_DIR),
-    OUTPUT_DIR: str = str(DEFAULT_OUTPUT_DIR),
+    INPUT_DIR: str | Path = str(DEFAULT_INPUT_DIR),
+    OUTPUT_DIR: str | Path = str(DEFAULT_OUTPUT_DIR),
+    features_file: str = FEATURES_FILE,
 ) -> None:
-    in_dir = Path(INPUT_DIR)
-    out_dir = Path(OUTPUT_DIR)
+    in_dir = Path(INPUT_DIR).expanduser()
+    out_dir = Path(OUTPUT_DIR).expanduser()
     ensure_dir(out_dir)
 
-    feature_path = in_dir / FEATURES_FILE
+    feature_path = in_dir / features_file
     if not feature_path.exists():
         raise FileNotFoundError(f"Expected feature file: {feature_path}")
 
@@ -311,7 +322,7 @@ def main(
     compare_df.to_csv(out_dir / "regime_fast_vs_slow_comparison_1dte.csv", index=False)
     regime_day_df.to_csv(out_dir / "regime_day_summary_1dte.csv", index=False)
 
-    plot_day = choose_plot_day(df, PLOT_DAY)
+    plot_day = resolve_plot_day(df, PLOT_DAY)
     plot_intraday_regimes(df, plot_day, out_dir)
 
     print("Regime fit summary:")

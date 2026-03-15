@@ -3,9 +3,9 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 # ============================================================
@@ -22,7 +22,8 @@ MAX_ABS_K_MAIN = 0.03
 MAX_ABS_K_HEDGE = 0.02
 VEGA_MIN_HEDGE = 0.25
 
-# Regime-dependent execution
+# Rehedge schedule
+CONSTANT_INTERVAL_MIN = 1
 SLOW_REHEDGE_INTERVAL_MIN = 10
 STOCK_BAND_DELTA = 0.05
 STOCK_BAND_DELTAVEGA = 0.05
@@ -30,11 +31,24 @@ OPTION_BAND_DELTAVEGA = 0.05
 FAST_REHEDGE_EVERY_MIN = True
 
 # Optional costs
-STOCK_TC_PER_SHARE = 0.00
-OPTION_TC_PER_UNIT = 0.00
+STOCK_TC_PER_SHARE = 0.0
+OPTION_TC_PER_UNIT = 0.0
 
+
+def _coerce_cost(value: object, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not np.isfinite(v):
+        return default
+    return v
+
+# Numerical knobs
 DELTA_BUMP_FRAC = 1e-4
 SIGMA_BUMP = 0.005
+CURVATURE_BUMP = 10.0
+TAU_BUMP = 1.0 / (252.0 * 390.0)
 MAX_ABS_HEDGE_OPTION_UNITS = 10.0
 
 
@@ -45,18 +59,18 @@ def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def bs_price(cp: str, S: float, K: float, tau: float, sigma: float, r: float = 0.0) -> float:
+def bs_price(cp: str, S: float, K: float, tau: float, sigma: float, r: float = 0.0, q: float = 0.0) -> float:
     S = max(float(S), 1e-12)
     K = max(float(K), 1e-12)
     tau = max(float(tau), 1e-10)
     sigma = min(max(float(sigma), 1e-8), 5.0)
 
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * tau) / (sigma * math.sqrt(tau))
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * tau) / (sigma * math.sqrt(tau))
     d2 = d1 - sigma * math.sqrt(tau)
 
     if str(cp).upper().startswith("C"):
-        return S * norm_cdf(d1) - K * math.exp(-r * tau) * norm_cdf(d2)
-    return K * math.exp(-r * tau) * norm_cdf(-d2) - S * norm_cdf(-d1)
+        return S * math.exp(-q * tau) * norm_cdf(d1) - K * math.exp(-r * tau) * norm_cdf(d2)
+    return K * math.exp(-r * tau) * norm_cdf(-d2) - S * math.exp(-q * tau) * norm_cdf(-d1)
 
 
 def smile_iv(S: float, K: float, sigma_atm: float, skew: float, curvature: float,
@@ -78,7 +92,7 @@ def surface_delta(cp: str, S: float, K: float, tau: float,
                   r: float = 0.0, bump_frac: float = DELTA_BUMP_FRAC) -> float:
     h = max(abs(float(S)) * bump_frac, 1e-3)
     up = surface_price(cp, S + h, K, tau, sigma_atm, skew, curvature, r)
-    dn = surface_price(cp, max(S - h, 1e-8), K, tau, sigma_atm, skew, curvature, r)
+    dn = surface_price(cp, max(float(S) - h, 1e-8), K, tau, sigma_atm, skew, curvature, r)
     return (up - dn) / (2.0 * h)
 
 
@@ -90,22 +104,66 @@ def surface_vega_atm(cp: str, S: float, K: float, tau: float,
     return (up - dn) / (2.0 * bump)
 
 
+def surface_delta_vega_bs(cp: str, S: float, K: float, tau: float, sigma: float, r: float = 0.0) -> tuple[float, float]:
+    h = max(abs(float(S)) * DELTA_BUMP_FRAC, 1e-4)
+    up = bs_price(cp, S + h, K, tau, sigma, r)
+    dn = bs_price(cp, max(float(S) - h, 1e-8), K, tau, sigma, r)
+    delta = (up - dn) / (2.0 * h)
+
+    v_up = bs_price(cp, S, K, tau, sigma + SIGMA_BUMP, r)
+    v_dn = bs_price(cp, S, K, tau, max(float(sigma) - SIGMA_BUMP, 1e-8), r)
+    vega = (v_up - v_dn) / (2.0 * SIGMA_BUMP)
+
+    return delta, vega
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    if value is None or pd.isna(value):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_datetime_col(df: pd.DataFrame, col: str) -> pd.Series:
+    s = pd.to_datetime(df[col], errors="coerce")
+    if isinstance(s.dtype, pd.DatetimeTZDtype):
+        s = s.dt.tz_convert(None)
+    return s.astype("datetime64[ns]")
+
+
+def _to_naive_ns(df_or_series: pd.Series | pd.DataFrame, col: str | None = None) -> pd.Series:
+    if col is None:
+        return pd.to_datetime(df_or_series, errors="coerce")
+    s = pd.to_datetime(df_or_series[col], errors="coerce")
+    if isinstance(s.dtype, pd.DatetimeTZDtype):
+        s = s.dt.tz_convert(None)
+    return s.astype("datetime64[ns]")
+
+
 # ============================================================
-# Data build
+# Build mergeable panel of quotes + features
 # ============================================================
 def load_feature_panel(path: Path) -> pd.DataFrame:
     feat = pd.read_csv(path, parse_dates=["timestamp", "trade_date", "timestamp_next"])
-    feat["trade_date"] = pd.to_datetime(feat["trade_date"]).dt.normalize()
+    feat["timestamp"] = _coerce_datetime_col(feat, "timestamp")
+    feat["trade_date"] = _coerce_datetime_col(feat, "trade_date").dt.normalize()
     keep = [
         "timestamp", "trade_date", "regime", "regime_name", "event_score",
         "sigma_atm_pred", "skew_pred", "curvature_bfly_pred",
     ]
-    return feat[keep].sort_values(["trade_date", "timestamp"]).reset_index(drop=True)
+    out = feat[keep].copy()
+    if out["timestamp"].isna().any():
+        out = out[out["timestamp"].notna()].copy()
+    return out.sort_values(["trade_date", "timestamp"]).reset_index(drop=True)
 
 
 def load_quote_transitions(test_dates: set[pd.Timestamp], quotes_path: Path) -> pd.DataFrame:
     q = pd.read_csv(quotes_path, parse_dates=["timestamp", "trade_date", "expiry_date"])
-    q["trade_date"] = pd.to_datetime(q["trade_date"]).dt.normalize()
+    q["timestamp"] = _coerce_datetime_col(q, "timestamp")
+    q["trade_date"] = _coerce_datetime_col(q, "trade_date").dt.normalize()
+    q["expiry_date"] = _coerce_datetime_col(q, "expiry_date")
     q["cp"] = q["cp"].astype(str)
 
     q = q[q["trade_date"].isin(test_dates)].copy()
@@ -120,14 +178,17 @@ def load_quote_transitions(test_dates: set[pd.Timestamp], quotes_path: Path) -> 
     one_min_next = (q["timestamp"].shift(-1) - q["timestamp"]).dt.total_seconds().eq(60)
 
     qt = q.loc[same_contract_next & one_min_next].copy()
-
-    for col in ["timestamp", "mid", "S_used", "tau", "iv", "vega", "k"]:
+    for col in ["timestamp", "mid", "S_used", "tau", "iv", "vega", "k", "r"]:
         qt[f"{col}_next"] = q[col].shift(-1).loc[qt.index].values
 
     qt["contract_id"] = qt["cp"].astype(str) + "_" + qt["K"].round(6).astype(str)
     qt["abs_k"] = qt["k"].abs()
 
-    qt = qt[(qt["mid"] > MIN_MID) & (qt["mid_next"] > MIN_MID) & (qt["abs_k"] <= MAX_ABS_K_MAIN)].copy()
+    qt = qt[
+        (qt["mid"] > MIN_MID) &
+        (qt["mid_next"] > MIN_MID) &
+        (qt["abs_k"] <= MAX_ABS_K_MAIN)
+    ].copy()
     return qt.reset_index(drop=True)
 
 
@@ -153,7 +214,38 @@ def choose_fixed_hedges(qt: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_main_panel(qt: pd.DataFrame, feat: pd.DataFrame, hedge_choice: pd.DataFrame) -> pd.DataFrame:
-    main = qt.merge(feat, on=["timestamp", "trade_date"], how="inner").copy()
+    # Defensive timezone/object handling before merge.
+    qt = qt.copy()
+    feat = feat.copy()
+    qt["timestamp"] = _coerce_datetime_col(qt, "timestamp")
+    feat["timestamp"] = _coerce_datetime_col(feat, "timestamp")
+    qt["trade_date"] = _coerce_datetime_col(qt, "trade_date").dt.normalize()
+    feat["trade_date"] = _coerce_datetime_col(feat, "trade_date").dt.normalize()
+    qt = qt[qt["timestamp"].notna() & qt["trade_date"].notna()].copy()
+    feat = feat[feat["timestamp"].notna() & feat["trade_date"].notna()].copy()
+    # Final guard: convert merge keys to exact shared scalar representations.
+    qt["timestamp"] = _to_naive_ns(qt["timestamp"])
+    feat["timestamp"] = _to_naive_ns(feat["timestamp"])
+    qt["trade_date"] = _to_naive_ns(qt["trade_date"]).dt.normalize()
+    feat["trade_date"] = _to_naive_ns(feat["trade_date"]).dt.normalize()
+
+    qt["_merge_ts"] = qt["timestamp"].astype("int64")
+    feat["_merge_ts"] = feat["timestamp"].astype("int64")
+    qt["_merge_td"] = qt["trade_date"].values.astype("int64")
+    feat["_merge_td"] = feat["trade_date"].values.astype("int64")
+
+    main = qt.merge(
+        feat.drop(columns=["timestamp", "trade_date"]),
+        on=["_merge_ts", "_merge_td"],
+        how="inner",
+    ).copy()
+
+    # Restore merge key columns for downstream logic
+    if "timestamp_x" in main.columns:
+        main = main.rename(columns={"timestamp_x": "timestamp", "trade_date_x": "trade_date"})
+    else:
+        main["timestamp"] = pd.to_datetime(main["_merge_ts"]).astype("datetime64[ns]")
+        main["trade_date"] = pd.to_datetime(main["_merge_td"]).astype("datetime64[ns]")
 
     top1 = hedge_choice[hedge_choice["rank"] == 1][["trade_date", "expiry_date", "contract_id", "cp", "K"]].rename(
         columns={"contract_id": "hedge1_id", "cp": "hedge1_cp", "K": "hedge1_K"}
@@ -165,10 +257,12 @@ def build_main_panel(qt: pd.DataFrame, feat: pd.DataFrame, hedge_choice: pd.Data
     main = main.merge(top1, on=["trade_date", "expiry_date"], how="left")
     main = main.merge(top2, on=["trade_date", "expiry_date"], how="left")
 
+    # If current contract is top1, hedge with top2 so hedge instrument changes for most rows
     main["hedge_id"] = np.where(main["contract_id"] == main["hedge1_id"], main["hedge2_id"], main["hedge1_id"])
 
     hedge_lookup = qt[
-        ["timestamp", "trade_date", "expiry_date", "contract_id", "cp", "K", "mid", "mid_next", "S_used", "S_used_next", "tau", "r", "iv", "vega", "k"]
+        ["timestamp", "trade_date", "expiry_date", "contract_id", "cp", "K", "mid", "mid_next", "S_used",
+         "S_used_next", "tau", "r", "iv", "vega", "k"]
     ].copy()
     hedge_lookup = hedge_lookup.rename(columns={c: f"{c}_h" for c in hedge_lookup.columns if c not in ["timestamp", "trade_date", "expiry_date"]})
 
@@ -179,39 +273,64 @@ def build_main_panel(qt: pd.DataFrame, feat: pd.DataFrame, hedge_choice: pd.Data
         how="left",
     )
 
-    return main[main["contract_id_h"].notna()].reset_index(drop=True)
+    return main[main["contract_id_h"].notna()].reset_index(drop=True).drop(columns=["_merge_ts", "_merge_td"], errors="ignore")
 
 
 # ============================================================
-# Targets
+# Target generation (both Black-Scholes and model-predicted)
 # ============================================================
 def compute_targets(main: pd.DataFrame) -> pd.DataFrame:
     n = len(main)
     delta_main = np.zeros(n)
-    delta_hedge = np.zeros(n)
     vega_main = np.zeros(n)
+    delta_hedge = np.zeros(n)
     vega_hedge = np.zeros(n)
 
     for i, row in enumerate(main.itertuples(index=False)):
-        a = float(row.sigma_atm_pred)
-        b = float(row.skew_pred)
-        c = float(row.curvature_bfly_pred)
+        a = _safe_float(getattr(row, "sigma_atm_pred", np.nan))
+        b = _safe_float(getattr(row, "skew_pred", np.nan))
+        c = _safe_float(getattr(row, "curvature_bfly_pred", np.nan))
 
-        delta_main[i] = surface_delta(row.cp, row.S_used, row.K, row.tau, a, b, c, row.r)
-        vega_main[i] = surface_vega_atm(row.cp, row.S_used, row.K, row.tau, a, b, c, row.r)
+        r_main = _safe_float(getattr(row, "r", 0.0), default=0.0)
+        r_hedge = _safe_float(getattr(row, "r_h", 0.0), default=0.0)
 
-        delta_hedge[i] = surface_delta(row.cp_h, row.S_used_h, row.K_h, row.tau_h, a, b, c, row.r_h)
-        vega_hedge[i] = surface_vega_atm(row.cp_h, row.S_used_h, row.K_h, row.tau_h, a, b, c, row.r_h)
+        delta_main[i] = surface_delta(row.cp, row.S_used, row.K, row.tau, a, b, c, r_main)
+        vega_main[i] = surface_vega_atm(row.cp, row.S_used, row.K, row.tau, a, b, c, r_main)
+        delta_hedge[i] = surface_delta(row.cp_h, row.S_used_h, row.K_h, row.tau_h, a, b, c, r_hedge)
+        vega_hedge[i] = surface_vega_atm(row.cp_h, row.S_used_h, row.K_h, row.tau_h, a, b, c, r_hedge)
 
     out = main.copy()
-    out["target_stock_delta"] = -delta_main
-
+    out["target_stock_delta_model"] = -delta_main
     q_opt = -vega_main / np.where(np.abs(vega_hedge) > 1e-8, vega_hedge, np.nan)
     q_opt = np.clip(q_opt, -MAX_ABS_HEDGE_OPTION_UNITS, MAX_ABS_HEDGE_OPTION_UNITS)
-    q_stock = -(delta_main + q_opt * delta_hedge)
+    out["target_opt_deltavega_model"] = q_opt
+    out["target_stock_deltavega_model"] = -(delta_main + q_opt * delta_hedge)
 
-    out["target_opt_deltavega"] = q_opt
-    out["target_stock_deltavega"] = q_stock
+    # Black-Scholes/quoted-IV targets (flat surface)
+    delta_main = np.zeros(n)
+    vega_main = np.zeros(n)
+    delta_hedge = np.zeros(n)
+    vega_hedge = np.zeros(n)
+    for i, row in enumerate(main.itertuples(index=False)):
+        r_main = _safe_float(getattr(row, "r", 0.0), default=0.0)
+        r_hedge = _safe_float(getattr(row, "r_h", 0.0), default=0.0)
+        sigma_main = _safe_float(getattr(row, "iv", np.nan), default=_safe_float(getattr(row, "iv_h", np.nan), default=0.2))
+        sigma_hedge = _safe_float(getattr(row, "iv_h", np.nan), default=sigma_main)
+
+        d_m, v_m = surface_delta_vega_bs(row.cp, row.S_used, row.K, row.tau, sigma_main, r_main)
+        d_h, v_h = surface_delta_vega_bs(row.cp_h, row.S_used_h, row.K_h, row.tau_h, sigma_hedge, r_hedge)
+
+        delta_main[i] = d_m
+        vega_main[i] = v_m
+        delta_hedge[i] = d_h
+        vega_hedge[i] = v_h
+
+    out["target_stock_delta_bs"] = -delta_main
+    q_opt = -vega_main / np.where(np.abs(vega_hedge) > 1e-8, vega_hedge, np.nan)
+    q_opt = np.clip(q_opt, -MAX_ABS_HEDGE_OPTION_UNITS, MAX_ABS_HEDGE_OPTION_UNITS)
+    out["target_opt_deltavega_bs"] = q_opt
+    out["target_stock_deltavega_bs"] = -(delta_main + q_opt * delta_hedge)
+
     return out
 
 
@@ -241,18 +360,30 @@ def should_rehedge_regime(
 
     if stock_band is not None and stock_band > 0 and abs(target_stock - held_stock) >= stock_band:
         return True
-
     if opt_band is not None and opt_band > 0 and abs(target_opt - held_opt) >= opt_band:
         return True
-
     return False
 
 
-def run_policy(main: pd.DataFrame, hedge_type: str, execution: str) -> tuple[pd.DataFrame, dict]:
+def run_policy(
+    main: pd.DataFrame,
+    method_name: str,
+    execution: str,
+    interval_min: int,
+    target_source: str,
+    stock_tc_per_share: float = STOCK_TC_PER_SHARE,
+    option_tc_per_unit: float = OPTION_TC_PER_UNIT,
+) -> tuple[pd.DataFrame, dict]:
     rows = []
     total_rehedges = 0
     total_stock_turnover = 0.0
     total_option_turnover = 0.0
+    total_tc = 0.0
+    stock_tc_per_share = _coerce_cost(stock_tc_per_share, default=0.0)
+    option_tc_per_unit = _coerce_cost(option_tc_per_unit, default=0.0)
+
+    if target_source not in {"bs", "model"}:
+        raise ValueError("target_source must be 'bs' or 'model'")
 
     for _, g in main.groupby(["trade_date", "expiry_date", "cp", "K"], sort=False):
         g = g.sort_values("timestamp")
@@ -265,14 +396,14 @@ def run_policy(main: pd.DataFrame, hedge_type: str, execution: str) -> tuple[pd.
         dV_arr = (g["mid_next"] - g["mid"]).to_numpy(dtype=float)
         dH_arr = (g["mid_next_h"] - g["mid_h"]).to_numpy(dtype=float)
 
-        if hedge_type == "delta":
-            target_stock_arr = g["target_stock_delta"].to_numpy(dtype=float)
-            target_opt_arr = np.zeros(len(g), dtype=float)
-            stock_band = STOCK_BAND_DELTA
-            opt_band = None
+        if target_source == "bs":
+            target_stock_arr = g["target_stock_deltavega_bs"].to_numpy(dtype=float)
+            target_opt_arr = g["target_opt_deltavega_bs"].to_numpy(dtype=float)
+            stock_band = STOCK_BAND_DELTAVEGA
+            opt_band = OPTION_BAND_DELTAVEGA
         else:
-            target_stock_arr = g["target_stock_deltavega"].to_numpy(dtype=float)
-            target_opt_arr = g["target_opt_deltavega"].to_numpy(dtype=float)
+            target_stock_arr = g["target_stock_deltavega_model"].to_numpy(dtype=float)
+            target_opt_arr = g["target_opt_deltavega_model"].to_numpy(dtype=float)
             stock_band = STOCK_BAND_DELTAVEGA
             opt_band = OPTION_BAND_DELTAVEGA
 
@@ -283,18 +414,18 @@ def run_policy(main: pd.DataFrame, hedge_type: str, execution: str) -> tuple[pd.
         for i in range(len(g)):
             target_stock = float(target_stock_arr[i])
             target_opt = float(target_opt_arr[i])
+            timestamp = pd.Timestamp(ts_arr[i])
 
             if execution == "every_min":
                 if last_rehedge_ts is None:
                     do_rehedge = True
                 else:
-                    mins_since = (pd.Timestamp(ts_arr[i]) - last_rehedge_ts).total_seconds() / 60.0
-                    do_rehedge = mins_since >= 10
-                    
-            else:
+                    mins_since = (timestamp - last_rehedge_ts).total_seconds() / 60.0
+                    do_rehedge = mins_since >= interval_min
+            elif execution == "regime":
                 do_rehedge = should_rehedge_regime(
                     regime=int(regime_arr[i]),
-                    timestamp=pd.Timestamp(ts_arr[i]),
+                    timestamp=timestamp,
                     last_rehedge_ts=last_rehedge_ts,
                     target_stock=target_stock,
                     held_stock=held_stock,
@@ -303,14 +434,14 @@ def run_policy(main: pd.DataFrame, hedge_type: str, execution: str) -> tuple[pd.
                     stock_band=stock_band,
                     opt_band=opt_band,
                 )
+            else:
+                raise ValueError(f"Unknown execution mode: {execution}")
 
             d_stock_trade = 0.0
             d_opt_trade = 0.0
-
             if do_rehedge:
                 d_stock_trade = target_stock - held_stock
                 d_opt_trade = target_opt - held_opt
-
                 total_stock_turnover += abs(d_stock_trade)
                 total_option_turnover += abs(d_opt_trade)
 
@@ -319,27 +450,59 @@ def run_policy(main: pd.DataFrame, hedge_type: str, execution: str) -> tuple[pd.
 
                 held_stock = target_stock
                 held_opt = target_opt
-                last_rehedge_ts = pd.Timestamp(ts_arr[i])
+                last_rehedge_ts = timestamp
 
-            tc = STOCK_TC_PER_SHARE * abs(d_stock_trade) + OPTION_TC_PER_UNIT * abs(d_opt_trade)
+            stock_cost = stock_tc_per_share * abs(d_stock_trade)
+            option_cost = option_tc_per_unit * abs(d_opt_trade)
+            tc = stock_cost + option_cost
+            total_tc += tc
             err = float(dV_arr[i] + held_stock * dS_arr[i] + held_opt * dH_arr[i] - tc)
-
             rows.append(
                 {
                     "timestamp": ts_arr[i],
                     "trade_date": trade_date_arr[i],
                     "regime_name": regime_name_arr[i],
-                    "method": f"{hedge_type}_{execution}",
+                    "method": method_name,
                     "hedge_error": err,
                     "did_rehedge": bool(do_rehedge),
                     "trade_stock_abs": abs(d_stock_trade),
                     "trade_opt_abs": abs(d_opt_trade),
+                    "trade_tc": tc,
                 }
             )
 
+    if len(rows) == 0:
+        panel = pd.DataFrame(
+            columns=[
+                "timestamp",
+                "trade_date",
+                "regime_name",
+                "method",
+                "hedge_error",
+                "did_rehedge",
+                "trade_stock_abs",
+                "trade_opt_abs",
+            ]
+        )
+        stats = {
+            "method": method_name,
+            "n_obs": 0,
+            "mae": np.nan,
+            "rmse": np.nan,
+            "p95_abs_err": np.nan,
+            "mean_err": np.nan,
+                "n_rehedges": 0,
+                "stock_turnover": 0.0,
+                "option_turnover": 0.0,
+                "total_tc": 0.0,
+                "avg_tc_per_day": 0.0,
+                "avg_rehedges_per_day": 0.0,
+            }
+        return panel, stats
+
     panel = pd.DataFrame(rows)
     stats = {
-        "method": f"{hedge_type}_{execution}",
+        "method": method_name,
         "n_obs": int(len(panel)),
         "mae": float(panel["hedge_error"].abs().mean()),
         "rmse": float(np.sqrt(np.mean(panel["hedge_error"] ** 2))),
@@ -348,15 +511,28 @@ def run_policy(main: pd.DataFrame, hedge_type: str, execution: str) -> tuple[pd.
         "n_rehedges": int(total_rehedges),
         "stock_turnover": float(total_stock_turnover),
         "option_turnover": float(total_option_turnover),
+        "total_tc": float(total_tc),
+        "avg_tc_per_day": float(total_tc / max(panel["trade_date"].nunique(), 1)),
         "avg_rehedges_per_day": float(total_rehedges / max(panel["trade_date"].nunique(), 1)),
     }
     return panel, stats
 
 
-# ============================================================
-# Summaries / plots
-# ============================================================
 def summarize_by_day(panel_all: pd.DataFrame) -> pd.DataFrame:
+    if panel_all.empty or "trade_date" not in panel_all.columns:
+        return pd.DataFrame(
+            columns=[
+                "method",
+                "trade_date",
+                "mae",
+                "rmse",
+                "n_rehedges",
+                "stock_turnover",
+                "option_turnover",
+                "total_tc",
+                "avg_tc_per_day",
+            ]
+        )
     rows = []
     for (method, trade_date), grp in panel_all.groupby(["method", "trade_date"]):
         rows.append(
@@ -368,12 +544,31 @@ def summarize_by_day(panel_all: pd.DataFrame) -> pd.DataFrame:
                 "n_rehedges": int(grp["did_rehedge"].sum()),
                 "stock_turnover": float(grp["trade_stock_abs"].sum()),
                 "option_turnover": float(grp["trade_opt_abs"].sum()),
+                "total_tc": float(grp["trade_tc"].sum()) if "trade_tc" in grp.columns else 0.0,
+                "avg_tc_per_day": float(
+                    (grp["trade_tc"].sum() if "trade_tc" in grp.columns else 0.0)
+                    / max(grp["trade_date"].nunique(), 1)
+                ),
             }
         )
     return pd.DataFrame(rows)
 
 
 def summarize_by_regime(panel_all: pd.DataFrame) -> pd.DataFrame:
+    if panel_all.empty or "regime_name" not in panel_all.columns:
+        return pd.DataFrame(
+            columns=[
+                "method",
+                "regime_name",
+                "n_obs",
+                "mae",
+                "rmse",
+                "p95_abs_err",
+                "mean_err",
+                "rehedge_rate",
+                "total_tc",
+            ]
+        )
     rows = []
     for (method, regime_name), grp in panel_all.groupby(["method", "regime_name"]):
         rows.append(
@@ -386,6 +581,7 @@ def summarize_by_regime(panel_all: pd.DataFrame) -> pd.DataFrame:
                 "p95_abs_err": float(grp["hedge_error"].abs().quantile(0.95)),
                 "mean_err": float(grp["hedge_error"].mean()),
                 "rehedge_rate": float(grp["did_rehedge"].mean()),
+                "total_tc": float(grp["trade_tc"].sum()) if "trade_tc" in grp.columns else 0.0,
             }
         )
     return pd.DataFrame(rows)
@@ -394,8 +590,8 @@ def summarize_by_regime(panel_all: pd.DataFrame) -> pd.DataFrame:
 def make_plots(panel_all: pd.DataFrame, daily: pd.DataFrame, overall: pd.DataFrame, out_dir: Path) -> None:
     cum = (
         panel_all.groupby(["timestamp", "method"], as_index=False)["hedge_error"]
-                 .apply(lambda s: float(np.mean(np.abs(s))))
-                 .rename(columns={"hedge_error": "mean_abs_err"})
+        .apply(lambda s: float(np.mean(np.abs(s))))
+        .rename(columns={"hedge_error": "mean_abs_err"})
     )
     cum = cum.sort_values(["method", "timestamp"])
     cum["cum_abs_err"] = cum.groupby("method")["mean_abs_err"].cumsum()
@@ -403,7 +599,7 @@ def make_plots(panel_all: pd.DataFrame, daily: pd.DataFrame, overall: pd.DataFra
     plt.figure(figsize=(11, 4.5))
     for method, grp in cum.groupby("method"):
         plt.plot(grp["timestamp"], grp["cum_abs_err"], label=method)
-    plt.title("Cumulative absolute hedge error")
+    plt.title("Cumulative mean absolute hedge error")
     plt.xlabel("Timestamp")
     plt.ylabel("Cumulative mean absolute error")
     plt.legend()
@@ -440,6 +636,8 @@ def main(
     IV_INPUT_DIR: str = str(DEFAULT_IV_INPUT_DIR),
     FEATURE_INPUT_DIR: str = str(DEFAULT_FEATURE_INPUT_DIR),
     OUTPUT_DIR: str = str(DEFAULT_OUTPUT_DIR),
+    stock_tc_per_share: float = STOCK_TC_PER_SHARE,
+    option_tc_per_unit: float = OPTION_TC_PER_UNIT,
 ) -> None:
     iv_input_dir = Path(IV_INPUT_DIR)
     feat_input_dir = Path(FEATURE_INPUT_DIR)
@@ -456,59 +654,135 @@ def main(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     feat = load_feature_panel(pred_path)
+    print(f"[DEBUG] feature rows: {len(feat)} | feature dates: {feat['trade_date'].nunique()}")
+    if feat.empty:
+        raise ValueError(
+            "Calibration predictions are empty. Re-run Model_Calibration to generate "
+            f"{PRED_FEATURE_FILE} with non-empty test rows."
+        )
     test_dates = set(pd.to_datetime(feat["trade_date"]).dt.normalize().unique())
 
     qt = load_quote_transitions(test_dates, quotes_path)
+    print(f"[DEBUG] quote transition rows: {len(qt)} | quote dates: {qt['trade_date'].nunique()}")
     hedge_choice = choose_fixed_hedges(qt)
-    main = build_main_panel(qt, feat, hedge_choice)
-    main = compute_targets(main)
+    print(f"[DEBUG] hedge choice rows: {len(hedge_choice)}")
+    panel = build_main_panel(qt, feat, hedge_choice)
+    print(f"[DEBUG] main panel rows: {len(panel)}")
+    panel = compute_targets(panel)
 
     panels = []
     stats_rows = []
+    strategy_defs = [
+        ("deltavega_const_time_bs", "every_min", CONSTANT_INTERVAL_MIN, "bs"),
+        ("deltavega_regime_bs", "regime", 0, "bs"),
+        ("deltavega_regime_model", "regime", 0, "model"),
+    ]
 
-    for hedge_type, execution in [
-        ("delta", "every_min"),
-        ("delta", "regime"),
-        ("deltavega", "every_min"),
-        ("deltavega", "regime"),
-    ]:
-        panel_i, stats_i = run_policy(main, hedge_type=hedge_type, execution=execution)
+    for method_name, execution, interval_min, target_source in strategy_defs:
+        panel_i, stats_i = run_policy(
+            main=panel,
+            method_name=method_name,
+            execution=execution,
+            interval_min=interval_min,
+            target_source=target_source,
+            stock_tc_per_share=stock_tc_per_share,
+            option_tc_per_unit=option_tc_per_unit,
+        )
+        if panel_i.empty:
+            print(f"[WARN] {method_name}: produced no rows")
         panels.append(panel_i)
         stats_rows.append(stats_i)
 
     panel_all = pd.concat(panels, axis=0, ignore_index=True)
+    if panel_all.empty:
+        print("No simulation rows produced for any strategy.")
+        print("Verify that IV and calibration datasets share overlapping dates/timestamps.")
+        overall = pd.DataFrame(stats_rows).sort_values("method").reset_index(drop=True)
+        hedge_choice.to_csv(out_dir / "regime_rehedge_v2_fixed_hedge_contracts.csv", index=False)
+        overall.to_csv(out_dir / "regime_rehedge_v2_summary_overall.csv", index=False)
+        pd.DataFrame(
+            columns=[
+                "method",
+                "trade_date",
+                "mae",
+                "rmse",
+                "n_rehedges",
+                "stock_turnover",
+                "option_turnover",
+                "total_tc",
+                "avg_tc_per_day",
+            ]
+        ).to_csv(
+            out_dir / "regime_rehedge_v2_summary_by_day.csv", index=False
+        )
+        pd.DataFrame(
+            columns=[
+                "method",
+                "regime_name",
+                "n_obs",
+                "mae",
+                "rmse",
+                "p95_abs_err",
+                "mean_err",
+                "rehedge_rate",
+                "total_tc",
+            ]
+        ).to_csv(
+            out_dir / "regime_rehedge_v2_summary_by_regime.csv", index=False
+        )
+        pd.DataFrame(
+            columns=[
+                "method",
+                "mae_ratio_to_constant",
+                "rmse_ratio_to_constant",
+                "rehedge_ratio_to_constant",
+                "stock_turnover_ratio_to_constant",
+                "option_turnover_ratio_to_constant",
+                "total_tc_ratio_to_constant",
+                "avg_tc_ratio_to_constant",
+            ]
+        ).to_csv(
+            out_dir / "regime_rehedge_v2_reduction_vs_every_min.csv", index=False
+        )
+        return
+
     overall = pd.DataFrame(stats_rows).sort_values("method").reset_index(drop=True)
     by_day = summarize_by_day(panel_all)
     by_regime = summarize_by_regime(panel_all)
 
+    # Compare against the constant-time benchmark
+    base = overall.loc[overall["method"] == "deltavega_const_time_bs"].iloc[0]
     reduction_rows = []
-    for hedge_type in ["delta", "deltavega"]:
-        base = overall.loc[overall["method"] == f"{hedge_type}_every_min"].iloc[0]
-        rgm = overall.loc[overall["method"] == f"{hedge_type}_regime"].iloc[0]
+    for method in ["deltavega_regime_bs", "deltavega_regime_model"]:
+        other = overall.loc[overall["method"] == method].iloc[0]
         reduction_rows.append(
             {
-                "hedge_type": hedge_type,
-                "mae_ratio_regime_to_every": float(rgm["mae"] / base["mae"]),
-                "rmse_ratio_regime_to_every": float(rgm["rmse"] / base["rmse"]),
-                "rehedge_ratio_regime_to_every": float(rgm["n_rehedges"] / max(base["n_rehedges"], 1)),
-                "stock_turnover_ratio_regime_to_every": float(rgm["stock_turnover"] / max(base["stock_turnover"], 1e-12)),
-                "option_turnover_ratio_regime_to_every": float(rgm["option_turnover"] / max(base["option_turnover"], 1e-12)),
+                "method": method,
+                "mae_ratio_to_constant": float(other["mae"] / base["mae"]),
+                "rmse_ratio_to_constant": float(other["rmse"] / base["rmse"]),
+                "rehedge_ratio_to_constant": float(other["n_rehedges"] / max(base["n_rehedges"], 1)),
+                "stock_turnover_ratio_to_constant": float(other["stock_turnover"] / max(base["stock_turnover"], 1e-12)),
+                "option_turnover_ratio_to_constant": float(other["option_turnover"] / max(base["option_turnover"], 1e-12)),
+                "total_tc_ratio_to_constant": float(other["total_tc"] / max(base["total_tc"], 1e-12)),
+                "avg_tc_ratio_to_constant": float(
+                    (other["avg_tc_per_day"]) / max(base["avg_tc_per_day"], 1e-12)
+                    if not pd.isna(other["avg_tc_per_day"]) and not pd.isna(base["avg_tc_per_day"]) else np.nan
+                ),
             }
         )
-    reduction = pd.DataFrame(reduction_rows)
 
+    # Legacy file names used by the rest of the pipeline
     hedge_choice.to_csv(out_dir / "regime_rehedge_v2_fixed_hedge_contracts.csv", index=False)
     overall.to_csv(out_dir / "regime_rehedge_v2_summary_overall.csv", index=False)
     by_day.to_csv(out_dir / "regime_rehedge_v2_summary_by_day.csv", index=False)
     by_regime.to_csv(out_dir / "regime_rehedge_v2_summary_by_regime.csv", index=False)
-    reduction.to_csv(out_dir / "regime_rehedge_v2_reduction_vs_every_min.csv", index=False)
-
+    pd.DataFrame(reduction_rows).to_csv(out_dir / "regime_rehedge_v2_reduction_vs_every_min.csv", index=False)
     make_plots(panel_all, by_day, overall, out_dir=out_dir)
 
     print("Overall summary:")
     print(overall.to_string(index=False))
-    print("\nReduction vs every-minute:")
-    print(reduction.to_string(index=False))
+    print("\nReduction vs constant-time rehedge:")
+    print(pd.DataFrame(reduction_rows).to_string(index=False))
 
 
 if __name__ == "__main__":
