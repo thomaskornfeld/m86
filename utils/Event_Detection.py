@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import math
 import os
+from pathlib import Path
 import glob
-from typing import Tuple
+from typing import Tuple, cast
+
+from numpy.typing import NDArray
 
 import numpy as np
 import pandas as pd
@@ -19,10 +22,13 @@ FEATURES_OUT = "event_detection_features_from_cleaned_quotes.csv"
 EVENTS_OUT = "event_windows_summary.csv"
 OUTER_MODEL_OUT = "outer_model_coefficients.csv"
 OUTER_RESID_SUMMARY_OUT = "outer_residual_regime_summary.csv"
-DEFAULT_OUTPUT_DIR = "Event_Det_Out"
+DEFAULT_INPUT_DIR = Path(".")
+DEFAULT_OUTPUT_DIR = Path("Event_Det_Out")
+INPUT_FILE = "cleaned_quotes_with_iv_1dte.csv"
 
 PLOT_SCORE_PREFIX = "event_score"
 PLOT_STATE_PREFIX = "state_series"
+EVENT_PLOT_DIR = "images"
 
 ATM_K_ABS_MAX = 0.015
 ATM_TOP_N = 6
@@ -49,29 +55,32 @@ EPS = 1e-12
 # ============================================================
 # Output helpers
 # ============================================================
-def _out_path(filename: str, output_dir: str) -> str:
-    return os.path.join(output_dir, filename)
+def _out_path(filename: str, output_dir: Path) -> str:
+    return str(output_dir / filename)
 
 
-def cleanup_local_event_detection_outputs(output_dir: str) -> None:
-    os.makedirs(output_dir, exist_ok=True)
+def cleanup_local_event_detection_outputs(output_dir: Path, legacy_source_dir: Path | None = None) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = output_dir / EVENT_PLOT_DIR
+    images_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = legacy_source_dir or Path.cwd()
 
     legacy_files = [
-        os.path.basename(FEATURES_OUT),
-        os.path.basename(EVENTS_OUT),
-        os.path.basename(OUTER_MODEL_OUT),
-        os.path.basename(OUTER_RESID_SUMMARY_OUT),
+        Path(FEATURES_OUT).name,
+        Path(EVENTS_OUT).name,
+        Path(OUTER_MODEL_OUT).name,
+        Path(OUTER_RESID_SUMMARY_OUT).name,
     ]
 
     for name in legacy_files:
-        src = os.path.join(os.getcwd(), name)
-        if os.path.isfile(src):
+        src = source_dir / name
+        if src.is_file():
             dst = _out_path(name, output_dir=output_dir)
             os.replace(src, dst)
 
     for pattern in (f"{PLOT_SCORE_PREFIX}_*.png", f"{PLOT_STATE_PREFIX}_*.png"):
-        for src in glob.glob(pattern):
-            dst = _out_path(os.path.basename(src), output_dir=output_dir)
+        for src in source_dir.glob(pattern):
+            dst = str(images_dir / src.name)
             os.replace(src, dst)
 
 
@@ -148,11 +157,12 @@ def atm_iv_from_nearby(g_loc: pd.DataFrame, k_abs_max: float = 0.015, top_n: int
     if gg.empty:
         return float("nan")
 
-    w = shape_weights_from_df(gg)
+    w = shape_weights_from_df(gg).astype(float)
+    iv_values = gg["iv"].to_numpy(dtype=float)
     if np.sum(w) <= EPS:
-        return float(np.nanmedian(gg["iv"].values))
+        return float(np.nanmedian(iv_values))
 
-    return float(np.sum(w * gg["iv"].values) / np.sum(w))
+    return float(np.sum(w * iv_values) / np.sum(w))
 
 
 def build_sigma_skew_features_from_quotes(q: pd.DataFrame) -> pd.DataFrame:
@@ -165,7 +175,7 @@ def build_sigma_skew_features_from_quotes(q: pd.DataFrame) -> pd.DataFrame:
         if g_now.empty:
             continue
 
-        tau_med = float(np.nanmedian(g_now["tau"].values)) if not g_now.empty else float("nan")
+        tau_med = float(np.nanmedian(g_now["tau"].to_numpy(dtype=float))) if not g_now.empty else float("nan")
 
         g = g_now[np.isfinite(g_now["iv"]) & np.isfinite(g_now["S_used"]) & (g_now["S_used"] > 0)].copy()
         if g.empty:
@@ -236,8 +246,8 @@ def build_sigma_skew_features_from_quotes(q: pd.DataFrame) -> pd.DataFrame:
         if skew_ok:
             w_lin = shape_weights_from_df(g_lin)
             b_lin = weighted_slope_fixed_intercept(
-                g_lin["k"].values,
-                g_lin["iv"].values,
+                g_lin["k"].to_numpy(dtype=float),
+                g_lin["iv"].to_numpy(dtype=float),
                 w_lin,
                 sigma_atm,
             )
@@ -351,8 +361,9 @@ def hysteresis_event_labels(
     if len(x) == 0:
         return pd.Series(dtype=int)
 
-    high_thr = float(np.nanquantile(x, high_q))
-    low_thr = float(np.nanquantile(x, low_q))
+    x_series = pd.Series(x.astype(float))
+    high_thr = float(x_series.quantile(high_q))
+    low_thr = float(x_series.quantile(low_q))
 
     labels = np.zeros(len(x), dtype=int)
     state = 0
@@ -494,12 +505,15 @@ def summarize_event_windows(feat_evt: pd.DataFrame) -> pd.DataFrame:
             prev = val
         gg["event_block"] = event_block
 
-        for eid, w in gg.dropna(subset=["event_block"]).groupby("event_block"):
+        for i, (_, w) in enumerate(
+            gg.dropna(subset=["event_block"]).groupby("event_block"),
+            start=1,
+        ):
             rows.append(
                 {
                     "expiry": exp,
                     "date": day,
-                    "event_id": int(eid),
+                    "event_id": i,
                     "start_time": w["timestamp"].min(),
                     "end_time": w["timestamp"].max(),
                     "minutes": int(len(w)),
@@ -551,14 +565,14 @@ def fit_outer_var1(feat_evt: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         if len(calm) < 20:
             continue
 
-        X = np.column_stack([
-            np.ones(len(calm)),
-            calm["sigma_atm"].values,
-            calm["skew"].values,
+        X: NDArray[np.float64] = np.column_stack([
+            np.ones(len(calm), dtype=float),
+            calm["sigma_atm"].to_numpy(dtype=float),
+            calm["skew"].to_numpy(dtype=float),
         ])
 
-        y_sigma = calm["sigma_next"].values
-        y_skew = calm["skew_next"].values
+        y_sigma = calm["sigma_next"].to_numpy(dtype=float)
+        y_skew = calm["skew_next"].to_numpy(dtype=float)
 
         beta_sigma, *_ = np.linalg.lstsq(X, y_sigma, rcond=None)
         beta_skew, *_ = np.linalg.lstsq(X, y_skew, rcond=None)
@@ -584,10 +598,10 @@ def fit_outer_var1(feat_evt: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
             ]
         )
 
-        X_all = np.column_stack([
-            np.ones(len(gg)),
-            gg["sigma_atm"].ffill().bfill().values,
-            gg["skew"].ffill().bfill().values,
+        X_all: NDArray[np.float64] = np.column_stack([
+            np.ones(len(gg), dtype=float),
+            gg["sigma_atm"].ffill().bfill().to_numpy(dtype=float),
+            gg["skew"].ffill().bfill().to_numpy(dtype=float),
         ])
 
         gg["sigma_pred_outer"] = X_all @ beta_sigma
@@ -628,7 +642,10 @@ def summarize_outer_residuals(outer_fit: pd.DataFrame) -> pd.DataFrame:
             rows=("timestamp", "size"),
             mean_outer_resid_norm=("outer_resid_norm", "mean"),
             median_outer_resid_norm=("outer_resid_norm", "median"),
-            p95_outer_resid_norm=("outer_resid_norm", lambda s: float(np.nanquantile(s, 0.95))),
+            p95_outer_resid_norm=(
+                "outer_resid_norm",
+                lambda s: float(np.nanquantile(s.to_numpy(dtype=float), 0.95)),
+            ),
             mean_abs_sigma_resid=("abs_sigma_resid", "mean"),
             mean_abs_skew_resid=("abs_skew_resid", "mean"),
         )
@@ -663,17 +680,19 @@ def choose_plot_groups(feat_evt: pd.DataFrame, max_plots: int = 7) -> list[tuple
 
 def shade_event_windows(ax, gg: pd.DataFrame) -> None:
     in_event = False
-    start_ts = None
+    start_ts: pd.Timestamp | None = None
+    ts_series = pd.to_datetime(gg["timestamp"])
     for _, row in gg.iterrows():
+        ts = pd.to_datetime(row["timestamp"])
         if int(row["is_event"]) == 1 and not in_event:
             in_event = True
-            start_ts = row["timestamp"]
+            start_ts = ts
         elif int(row["is_event"]) == 0 and in_event:
-            ax.axvspan(pd.to_datetime(start_ts), pd.to_datetime(row["timestamp"]), alpha=0.2)
+            ax.axvspan(cast(pd.Timestamp, start_ts), ts, alpha=0.2)
             in_event = False
             start_ts = None
     if in_event and start_ts is not None:
-        ax.axvspan(pd.to_datetime(start_ts), pd.to_datetime(gg["timestamp"].iloc[-1]), alpha=0.2)
+        ax.axvspan(cast(pd.Timestamp, start_ts), ts_series.iloc[-1], alpha=0.2)
 
 
 def plot_selected_event_scores(feat_evt: pd.DataFrame, selected_groups: list[tuple], prefix: str) -> None:
@@ -724,14 +743,20 @@ def plot_selected_state_series(feat_evt: pd.DataFrame, selected_groups: list[tup
 # Main
 # ============================================================
 def main(
-    INPUT_FILE: str = "cleaned_quotes_with_iv_1dte.csv",
-    OUTPUT_DIR: str = DEFAULT_OUTPUT_DIR,
+    INPUT_DIR: str = str(DEFAULT_INPUT_DIR),
+    INPUT_FILE: str = INPUT_FILE,
+    OUTPUT_DIR: str = str(DEFAULT_OUTPUT_DIR),
 ) -> None:
-    output_dir = OUTPUT_DIR
-    cleanup_local_event_detection_outputs(output_dir=output_dir)
-    os.makedirs(output_dir, exist_ok=True)
+    input_dir = Path(INPUT_DIR).expanduser()
+    output_dir = Path(OUTPUT_DIR).expanduser()
+    input_file = input_dir / INPUT_FILE
 
-    q = pd.read_csv(INPUT_FILE)
+    cleanup_local_event_detection_outputs(output_dir=output_dir, legacy_source_dir=input_dir)
+
+    if not input_file.exists():
+        raise FileNotFoundError(f"Expected input file: {input_file}")
+
+    q = pd.read_csv(input_file)
 
     datetime_cols = ["timestamp", "expiry_date", "trade_date", "tbin", "quote_timestamp"]
     for c in datetime_cols:
@@ -774,28 +799,30 @@ def main(
     coef_df, outer_fit = fit_outer_var1(feat_evt)
     outer_resid_summary = summarize_outer_residuals(outer_fit)
 
-    feat_evt.to_csv(_out_path(os.path.basename(FEATURES_OUT), output_dir=output_dir), index=False)
-    events_summary.to_csv(_out_path(os.path.basename(EVENTS_OUT), output_dir=output_dir), index=False)
-    coef_df.to_csv(_out_path(os.path.basename(OUTER_MODEL_OUT), output_dir=output_dir), index=False)
-    outer_resid_summary.to_csv(_out_path(os.path.basename(OUTER_RESID_SUMMARY_OUT), output_dir=output_dir), index=False)
+    feat_evt.to_csv(_out_path(Path(FEATURES_OUT).name, output_dir=output_dir), index=False)
+    events_summary.to_csv(_out_path(Path(EVENTS_OUT).name, output_dir=output_dir), index=False)
+    coef_df.to_csv(_out_path(Path(OUTER_MODEL_OUT).name, output_dir=output_dir), index=False)
+    outer_resid_summary.to_csv(_out_path(Path(OUTER_RESID_SUMMARY_OUT).name, output_dir=output_dir), index=False)
 
     selected_groups = choose_plot_groups(feat_evt, max_plots=MAX_PLOTS)
+    plot_output_dir = output_dir / EVENT_PLOT_DIR
+    plot_output_dir.mkdir(parents=True, exist_ok=True)
     plot_selected_event_scores(
         feat_evt,
         selected_groups,
-        _out_path(PLOT_SCORE_PREFIX, output_dir=output_dir),
+        _out_path(PLOT_SCORE_PREFIX, output_dir=plot_output_dir),
     )
     plot_selected_state_series(
         feat_evt,
         selected_groups,
-        _out_path(PLOT_STATE_PREFIX, output_dir=output_dir),
+        _out_path(PLOT_STATE_PREFIX, output_dir=plot_output_dir),
     )
 
     print("\n[INFO] Files written:")
-    print(f"  {_out_path(os.path.basename(FEATURES_OUT), output_dir=output_dir)}")
-    print(f"  {_out_path(os.path.basename(EVENTS_OUT), output_dir=output_dir)}")
-    print(f"  {_out_path(os.path.basename(OUTER_MODEL_OUT), output_dir=output_dir)}")
-    print(f"  {_out_path(os.path.basename(OUTER_RESID_SUMMARY_OUT), output_dir=output_dir)}")
+    print(f"  {_out_path(Path(FEATURES_OUT).name, output_dir=output_dir)}")
+    print(f"  {_out_path(Path(EVENTS_OUT).name, output_dir=output_dir)}")
+    print(f"  {_out_path(Path(OUTER_MODEL_OUT).name, output_dir=output_dir)}")
+    print(f"  {_out_path(Path(OUTER_RESID_SUMMARY_OUT).name, output_dir=output_dir)}")
 
     print(f"\n[INFO] Plots written for up to {MAX_PLOTS} expiry/day groups:")
     for exp, day in selected_groups:
