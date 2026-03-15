@@ -3,14 +3,14 @@ from __future__ import annotations
 import math
 import re
 from datetime import time
+from pathlib import Path
 from time import perf_counter
 from typing import Dict, Optional, Tuple
+from numpy.typing import ArrayLike
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import os
-import glob
 try:
     from tqdm.auto import tqdm
 except Exception:
@@ -18,9 +18,16 @@ except Exception:
         return iterable if iterable is not None else []
 
 
+RISK_FREE_RATE = 0
+
 # -----------------------------
 # Timing helper
 # -----------------------------
+DEFAULT_INPUT_DIR = Path(".")
+DEFAULT_OUTPUT_DIR = Path("IV_Out")
+DEFAULT_WORKBOOK = "MATH_86_Kason_2.xlsx"
+
+
 def log_stage(msg: str, t0: float) -> float:
     now = perf_counter()
     print(f"[TIMER] {msg}: {now - t0:,.2f}s")
@@ -168,7 +175,7 @@ def parse_sheet_to_quotes(df_raw: pd.DataFrame, sheet_name: str) -> pd.DataFrame
         if i + 4 >= ncols:
             continue
 
-        contract = df_raw.iloc[0, i]
+        contract = str(df_raw.iloc[0, i])
         info = parse_contract_name(contract)
         if info is None:
             continue
@@ -180,11 +187,11 @@ def parse_sheet_to_quotes(df_raw: pd.DataFrame, sheet_name: str) -> pd.DataFrame
 
         tmp = pd.DataFrame(
             {
-                "timestamp": df_raw.iloc[2:, i].apply(_safe_to_datetime).values,
-                "open": pd.to_numeric(df_raw.iloc[2:, i + 1], errors="coerce").values,
-                "close": pd.to_numeric(df_raw.iloc[2:, i + 2], errors="coerce").values,
-                "value": pd.to_numeric(df_raw.iloc[2:, i + 3], errors="coerce").values,
-                "volume": pd.to_numeric(df_raw.iloc[2:, i + 4], errors="coerce").values,
+                "timestamp": pd.to_datetime(df_raw.iloc[2:, i].map(_safe_to_datetime)),
+                "open": pd.to_numeric(df_raw.iloc[2:, i + 1], errors="coerce").to_numpy(),
+                "close": pd.to_numeric(df_raw.iloc[2:, i + 2], errors="coerce").to_numpy(),
+                "value": pd.to_numeric(df_raw.iloc[2:, i + 3], errors="coerce").to_numpy(),
+                "volume": pd.to_numeric(df_raw.iloc[2:, i + 4], errors="coerce").to_numpy(),
             }
         )
 
@@ -212,12 +219,14 @@ def parse_sheet_to_quotes(df_raw: pd.DataFrame, sheet_name: str) -> pd.DataFrame
     return q
 
 
-def parse_workbook_to_quotes(file_path: str) -> pd.DataFrame:
-    xls = pd.ExcelFile(file_path)
+def parse_workbook_to_quotes(file_path: str | Path) -> pd.DataFrame:
+    """Load all sheets from an options workbook and return a unified raw quote panel."""
+    workbook_path = Path(file_path).expanduser()
+    xls = pd.ExcelFile(workbook_path)
     all_quotes = []
 
     for sh in tqdm(xls.sheet_names, desc="Reading workbook sheets"):
-        df_raw = pd.read_excel(file_path, sheet_name=sh, header=None)
+        df_raw = pd.read_excel(workbook_path, sheet_name=sh, header=None)
         q = parse_sheet_to_quotes(df_raw, sh)
         if not q.empty:
             all_quotes.append(q)
@@ -291,8 +300,8 @@ def infer_spot_from_parity(
         raise ValueError("No valid positive spot estimates from parity.")
 
     def robust_weighted_spot(g: pd.DataFrame) -> float:
-        x = g["S_parity"].values.astype(float)
-        w = np.sqrt(np.clip(g["pair_volume"].fillna(1.0).values.astype(float), 1.0, None))
+        x = g["S_parity"].to_numpy(dtype=float)
+        w = np.sqrt(np.clip(g["pair_volume"].fillna(1.0).to_numpy(dtype=float), 1.0, None))
         med = np.nanmedian(x)
         mad = np.nanmedian(np.abs(x - med))
         if np.isfinite(mad) and mad > 0:
@@ -317,9 +326,9 @@ def infer_spot_from_parity(
 # Surface fit helpers
 # -----------------------------
 def weighted_slope_fixed_intercept(
-    k: np.ndarray,
-    y: np.ndarray,
-    w: np.ndarray,
+    k: ArrayLike,
+    y: ArrayLike,
+    w: ArrayLike,
     intercept: float,
 ) -> float:
     k = np.asarray(k, float)
@@ -339,9 +348,9 @@ def weighted_slope_fixed_intercept(
 
 
 def weighted_quadratic_fixed_intercept(
-    k: np.ndarray,
-    y: np.ndarray,
-    w: np.ndarray,
+    k: ArrayLike,
+    y: ArrayLike,
+    w: ArrayLike,
     intercept: float,
 ) -> Tuple[float, float]:
     k = np.asarray(k, float)
@@ -417,9 +426,9 @@ def atm_iv_from_nearby(g_loc: pd.DataFrame, k_abs_max: float = 0.015, top_n: int
 
     w = shape_weights_from_df(gg)
     if np.sum(w) <= 1e-12:
-        return float(np.nanmedian(gg["iv"].values))
+        return float(np.nanmedian(gg["iv"].to_numpy(dtype=float)))
 
-    return float(np.sum(w * gg["iv"].values) / np.sum(w))
+    return float(np.sum(w * gg["iv"].to_numpy(dtype=float)) / np.sum(w))
 
 
 def local_curvature_from_quadratic(
@@ -464,8 +473,8 @@ def local_curvature_from_quadratic(
         return float("nan")
 
     b, c = weighted_quadratic_fixed_intercept(
-        gg["k"].values,
-        gg["iv"].values,
+        gg["k"].to_numpy(dtype=float),
+        gg["iv"].to_numpy(dtype=float),
         w,
         sigma_atm,
     )
@@ -496,28 +505,26 @@ def keep_only_1dte(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 # Main pipeline
 # -----------------------------
-def run_pipeline(
-    file_path: str,
-    time_bin: str = "1min",
-    spot_time_bin: str = "10s",
-    asof_tolerance_seconds: int = 90,
-    min_price: float = 0.01,
-    k_window: float = 0.15,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    stage_t = perf_counter()
-    total_t = perf_counter()
+def _attach_tau_from_expiry(df: pd.DataFrame, settle_hour: int = 16) -> pd.DataFrame:
+    out = df.copy()
+    out["expiry_dt"] = out["expiry_date"].apply(lambda d: pd.Timestamp.combine(d.date(), time(settle_hour, 0)))
+    out["tau_min"] = (out["expiry_dt"] - out["timestamp"]).dt.total_seconds() / 60.0
+    out["tau"] = out["tau_min"] / (365.0 * 24.0 * 60.0)
+    return out
 
+
+def _build_raw_quote_panel(
+    file_path: str | Path,
+    spot_time_bin: str,
+    asof_tolerance_seconds: int,
+    min_price: float,
+    settle_hour: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Parse workbook, merge in parity spot, and filter to valid 1DTE candidate rows."""
     quotes = parse_workbook_to_quotes(file_path)
-    stage_t = log_stage("Workbook parsed", stage_t)
-
     spot = infer_spot_from_parity(quotes, time_bin=spot_time_bin, min_pair_volume=1.0)
-    stage_t = log_stage("Spot inferred", stage_t)
 
-    quotes["expiry_dt"] = quotes["expiry_date"].apply(lambda d: pd.Timestamp.combine(d.date(), time(16, 0)))
-    quotes["tau_min"] = (quotes["expiry_dt"] - quotes["timestamp"]).dt.total_seconds() / 60.0
-    quotes["tau"] = quotes["tau_min"] / (365.0 * 24.0 * 60.0)
-
-    q = quotes.copy()
+    q = _attach_tau_from_expiry(quotes, settle_hour=settle_hour)
     q = q[np.isfinite(q["mid"]) & (q["mid"] >= min_price)].copy()
     q = q[(q["tau_min"] > 0) & (q["tau_min"] < 7 * 24 * 60)].copy()
     q["volume"] = pd.to_numeric(q["volume"], errors="coerce").fillna(0.0)
@@ -532,17 +539,25 @@ def run_pipeline(
     )
     q = q.dropna(subset=["S_used"]).copy()
     q = q[q["S_used"] > 0].copy()
-
     q = keep_only_1dte(q)
+
     if q.empty:
         raise ValueError("No 1DTE rows found after filtering. Check trade timestamps and expiry dates.")
 
-    stage_t = log_stage("Initial cleaning, spot merge, and 1DTE filter", stage_t)
+    return q, quotes, spot
 
-    lookback_seconds = 120
-    max_quote_age_seconds = 90
-    spot_tolerance_seconds = 90
 
+def _synchronize_minute_grid(
+    q: pd.DataFrame,
+    spot: pd.DataFrame,
+    time_bin: str,
+    lookback_seconds: int = 120,
+    max_quote_age_seconds: int = 90,
+    spot_tolerance_seconds: int = 90,
+    settle_hour: int = 16,
+) -> pd.DataFrame:
+    """Build a regular minute grid and backward-merge each contract onto it."""
+    q = q.copy()
     q["tbin"] = q["timestamp"].dt.floor(time_bin)
     t0 = q["tbin"].min()
     t1 = q["tbin"].max()
@@ -598,20 +613,19 @@ def run_pipeline(
     q_sync = q_sync.dropna(subset=["S_used"]).copy()
     q_sync = q_sync[q_sync["S_used"] > 0].copy()
 
-    q_sync["expiry_dt"] = q_sync["expiry_date"].apply(lambda d: pd.Timestamp.combine(d.date(), time(16, 0)))
-    q_sync["tau_min"] = (q_sync["expiry_dt"] - q_sync["timestamp"]).dt.total_seconds() / 60.0
-    q_sync["tau"] = q_sync["tau_min"] / (365.0 * 24.0 * 60.0)
-
+    q_sync = _attach_tau_from_expiry(q_sync, settle_hour=settle_hour)
     q_sync = keep_only_1dte(q_sync)
+
     if q_sync.empty:
         raise ValueError("No 1DTE rows remain after minute synchronization.")
 
-    q = q_sync
-    stage_t = log_stage("Minute sync complete", stage_t)
+    return q_sync
 
-    # IV + vega with progress bar
-    r = 0.0
-    q["r"] = r
+
+def _compute_iv_vega(q: pd.DataFrame) -> pd.DataFrame:
+    """Compute IV and vega for every synchronized quote row."""
+    q = q.copy()
+    q["r"] = RISK_FREE_RATE
     ivs = []
     vegas = []
 
@@ -631,12 +645,50 @@ def run_pipeline(
 
     q["iv"] = ivs
     q["vega"] = vegas
-
     q["k"] = np.log(q["K"] / q["S_used"])
-    q = q[np.isfinite(q["k"])].copy()
+    return q[np.isfinite(q["k"])].copy()
+
+
+def run_pipeline(
+    file_path: str | Path,
+    time_bin: str = "1min",
+    spot_time_bin: str = "10s",
+    asof_tolerance_seconds: int = 90,
+    min_price: float = 0.01,
+    k_window: float = 0.15,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Execute IV extraction and 1DTE feature generation from an options workbook path."""
+    stage_t = perf_counter()
+    total_t = perf_counter()
+
+    q, quotes, spot = _build_raw_quote_panel(
+        file_path=file_path,
+        spot_time_bin=spot_time_bin,
+        asof_tolerance_seconds=asof_tolerance_seconds,
+        min_price=min_price,
+        settle_hour=16,
+    )
+    # 1) Quote panel creation + parity spot inference
+    stage_t = log_stage("Initial quote panel + spot merge + 1DTE filtering", stage_t)
+
+    # 2) Synchronize all contracts to the minute grid with bounded quote lag
+    q = _synchronize_minute_grid(
+        q=q,
+        spot=spot,
+        time_bin=time_bin,
+        lookback_seconds=120,
+        max_quote_age_seconds=90,
+        spot_tolerance_seconds=90,
+        settle_hour=16,
+    )
+    stage_t = log_stage("Minute sync complete", stage_t)
+
+    # 3) Invert implied vol surface and Greeks
+    q = _compute_iv_vega(q)
     stage_t = log_stage("IVs and vegas computed", stage_t)
 
-        # -----------------------------
+    # 4) Run sanity checks on the synchronized IV surface before feature estimation.
+    # -----------------------------
     # Validation block
     # -----------------------------
     print("\n" + "=" * 80)
@@ -852,8 +904,9 @@ def run_pipeline(
         skew = float("nan")
         curvature = float("nan")
 
-        shape_cap = 0.035
-        atm_band = 0.006
+        # Window sizes below are driven by k_window so feature sensitivity scales consistently.
+        shape_cap = min(k_window, 0.035)
+        atm_band = min(0.006, 0.5 * k_window)
 
         g_shape = g[g["abs_k"] <= shape_cap].copy()
         if g_shape.empty:
@@ -916,8 +969,8 @@ def run_pipeline(
         if skew_ok:
             w_lin = shape_weights_from_df(g_lin)
             b_lin = weighted_slope_fixed_intercept(
-                g_lin["k"].values,
-                g_lin["iv"].values,
+                g_lin["k"].to_numpy(dtype=float),
+                g_lin["iv"].to_numpy(dtype=float),
                 w_lin,
                 sigma_atm,
             )
@@ -938,7 +991,7 @@ def run_pipeline(
             if right_span < skew_min_span:
                 drop["right_span_fail"] += 1
 
-        curve_cap = 0.025
+        curve_cap = min(k_window, 0.025)
         g_curve = g_shape[g_shape["abs_k"] <= curve_cap].copy()
 
         curv = local_curvature_from_quadratic(
@@ -971,7 +1024,8 @@ def run_pipeline(
 
     feat = pd.DataFrame(feats).sort_values(["expiry", "timestamp"]).reset_index(drop=True)
 
-        # -----------------------------
+    # 8) Summarize support counts and feature coverage diagnostics.
+    # -----------------------------
     # Feature validation block
     # -----------------------------
     print("\n" + "=" * 80)
@@ -1047,7 +1101,7 @@ def run_pipeline(
 def plot_timeseries(
     feat: pd.DataFrame,
     bucket: str,
-    out_prefix: str,
+    out_prefix: str | Path,
     feature_cols: tuple[str, ...] = ("sigma_atm", "skew", "curvature"),
     n_days: int = 2,
     random_state: int = 42,
@@ -1076,8 +1130,8 @@ def plot_timeseries(
         "curvature": "Curvature d²σ/dk²|0",
     }
 
-    def _break_gaps(ts: pd.Series, y: pd.Series, local_gap_minutes: float):
-        ts = pd.to_datetime(ts).values.astype("datetime64[ns]")
+    def _break_gaps(ts: ArrayLike, y: ArrayLike, local_gap_minutes: float):
+        ts = pd.to_datetime(pd.Series(ts)).to_numpy(dtype="datetime64[ns]")
         y = np.asarray(y, dtype=float)
         if len(ts) == 0:
             return ts, y
@@ -1101,6 +1155,9 @@ def plot_timeseries(
         dd = d[d["date"] == day].copy()
         if dd.empty:
             continue
+
+        day_dir = Path(out_prefix) / str(day)
+        day_dir.mkdir(parents=True, exist_ok=True)
 
         for col in feature_cols:
             if col not in dd.columns:
@@ -1150,11 +1207,11 @@ def plot_timeseries(
 
             plt.tight_layout()
 
-            out_file = f"{out_prefix}_{bucket}_{col}_{day}.png"
-            plt.savefig(out_file, dpi=140)
+            out_file = day_dir / f"{bucket}_{col}.png"
+            plt.savefig(str(out_file), dpi=140)
             plt.close()
 
-            written_files.append(out_file)
+            written_files.append(str(out_file))
 
     return selected_days
 
@@ -1163,7 +1220,7 @@ def plot_snapshot(
     quotes_iv: pd.DataFrame,
     selected_days,
     k_window: float,
-    out_prefix: str,
+    out_prefix: str | Path,
 ):
     q = quotes_iv.copy()
     if q.empty:
@@ -1183,6 +1240,9 @@ def plot_snapshot(
         day_q = q[q["trade_date"] == day].copy()
         if day_q.empty:
             continue
+
+        day_dir = Path(out_prefix) / str(day)
+        day_dir.mkdir(parents=True, exist_ok=True)
 
         counts = (
             day_q.groupby(["tbin", "expiry_date"])
@@ -1218,11 +1278,11 @@ def plot_snapshot(
 
         w = shape_weights_from_df(snap_loc)
         b, c = weighted_quadratic_fixed_intercept(
-            snap_loc["k"].values,
-            snap_loc["iv"].values,
-            w,
-            sigma_atm,
-        )
+                snap_loc["k"].to_numpy(dtype=float),
+                snap_loc["iv"].to_numpy(dtype=float),
+                w,
+                sigma_atm,
+            )
         if not (np.isfinite(b) and np.isfinite(c)):
             continue
 
@@ -1246,26 +1306,43 @@ def plot_snapshot(
         ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
 
-        out_file = f"{out_prefix}_{i}.png"
-        fig.savefig(out_file, dpi=150)
+        out_file = day_dir / f"snapshot_{i}.png"
+        fig.savefig(str(out_file), dpi=150)
         plt.close(fig)
 
-        written_files.append(out_file)
+        written_files.append(str(out_file))
 
     return written_files
 
 
-def main(options_data_path : str = "MATH_86_Kason_2.xlsx", out_put_path : str = '/'):
-    options_xlsx_path = options_data_path
-    output_dir = out_put_path
-    os.makedirs(output_dir, exist_ok=True)
+def main(
+    INPUT_DIR: str | Path = DEFAULT_INPUT_DIR,
+    OUTPUT_DIR: str | Path = DEFAULT_OUTPUT_DIR,
+    options_filename: str | Path = DEFAULT_WORKBOOK,
+    output_dir: str | Path | None = None,
+    options_data_path: str | Path | None = None,
+    k_window: float = 0.15,
+):
+    """Run the IV pipeline and write outputs to OUTPUT_DIR."""
+    # Build explicit input/output paths to make notebook reruns deterministic.
+    if options_data_path is None:
+        options_xlsx_path = Path(INPUT_DIR).expanduser() / options_filename
+    else:
+        options_xlsx_path = Path(options_data_path).expanduser()
+
+    if output_dir is not None:
+        OUTPUT_DIR = output_dir
+
+
+    output_dir = Path(OUTPUT_DIR).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     quotes_iv, feat = run_pipeline(
         file_path=options_xlsx_path,
         time_bin="1min",
         spot_time_bin="10s",
         asof_tolerance_seconds=90,
-        k_window=0.15,
+        k_window=k_window,
     )
 
     cleaned_cols = [
@@ -1279,8 +1356,8 @@ def main(options_data_path : str = "MATH_86_Kason_2.xlsx", out_put_path : str = 
     ]
     cleaned_cols = [c for c in cleaned_cols if c in quotes_iv.columns]
 
-    cleaned_quotes_file_csv = os.path.join(output_dir, "cleaned_quotes_with_iv_1dte.csv")
-    features_file_csv = os.path.join(output_dir, "iv_surface_features_1dte.csv")
+    cleaned_quotes_file_csv = output_dir / "cleaned_quotes_with_iv_1dte.csv"
+    features_file_csv = output_dir / "iv_surface_features_1dte.csv"
 
     cleaned_quotes_out = quotes_iv[cleaned_cols].copy()
     cleaned_quotes_out.to_csv(cleaned_quotes_file_csv, index=False)
@@ -1289,10 +1366,13 @@ def main(options_data_path : str = "MATH_86_Kason_2.xlsx", out_put_path : str = 
     print(f"[FILE WRITTEN] {cleaned_quotes_file_csv}")
     print(f"[FILE WRITTEN] {features_file_csv}")
 
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
     selected_days = plot_timeseries(
         feat,
         "1DTE",
-        os.path.join(output_dir, "timeseries"),
+        plots_dir,
         feature_cols=("sigma_atm", "skew", "curvature"),
         n_days=2,
         random_state=42,
@@ -1301,33 +1381,9 @@ def main(options_data_path : str = "MATH_86_Kason_2.xlsx", out_put_path : str = 
     plot_snapshot(
         quotes_iv,
         selected_days,
-        0.15,
-        os.path.join(output_dir, "iv_surface_snapshot"),
+        k_window,
+        plots_dir,
     )
 
 if __name__ == "__main__":
-
-
-    output_dir = "/Users/brendonbazzani/VS Code Projects-python"
-
-    files_to_delete = [
-        "cleaned_quotes_with_iv_1dte.csv",
-        "iv_surface_features_1dte.csv",
-        "iv_surface_snapshot_1.png",
-        "iv_surface_snapshot_2.png",
-    ]
-
-    for fn in files_to_delete:
-        path = os.path.join(output_dir, fn)
-        if os.path.exists(path):
-            os.remove(path)
-
-    for pattern in [
-        "timeseries_1DTE_sigma_atm_*.png",
-        "timeseries_1DTE_skew_*.png",
-        "timeseries_1DTE_curvature_*.png",
-    ]:
-        for file in glob.glob(os.path.join(output_dir, pattern)):
-            os.remove(file)
-
     main()
