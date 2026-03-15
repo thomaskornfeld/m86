@@ -263,8 +263,8 @@ def main(
     INPUT_DIR: str = str(DEFAULT_INPUT_DIR),
     OUTPUT_DIR: str = str(DEFAULT_OUTPUT_DIR),
 ) -> None:
-    input_dir = Path(INPUT_DIR)
-    output_dir = Path(OUTPUT_DIR)
+    input_dir = Path(INPUT_DIR).expanduser()
+    output_dir = Path(OUTPUT_DIR).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = input_dir / IV_INPUT_FILE
