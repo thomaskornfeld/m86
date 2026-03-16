@@ -9,3 +9,6 @@ numba
 tqdm
 arch
 scikit-learn
+openpyxl
+ipywidgets
+jupyter
